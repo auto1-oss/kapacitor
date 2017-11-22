@@ -65,21 +65,23 @@ func (s *Service) Global() bool {
 }
 
 type testOptions struct {
-	Teams       []string `json:"teams"`
-	Recipients  []string `json:"recipients"`
-	MessageType string   `json:"message-type"`
-	Message     string   `json:"message"`
-	EntityID    string   `json:"entity-id"`
+	Teams        []string `json:"teams"`
+	Recipients   []string `json:"recipients"`
+	MessageType  string   `json:"message-type"`
+	PreviousType string   `json:"previous-type"`
+	Message      string   `json:"message"`
+	EntityID     string   `json:"entity-id"`
 }
 
 func (s *Service) TestOptions() interface{} {
 	c := s.config()
 	return &testOptions{
-		Teams:       c.Teams,
-		Recipients:  c.Recipients,
-		MessageType: "CRITICAL",
-		Message:     "test opsgenie message",
-		EntityID:    "testEntityID",
+		Teams:        c.Teams,
+		Recipients:   c.Recipients,
+		MessageType:  "CRITICAL",
+		PreviousType: "WARNING",
+		Message:      "test opsgenie message",
+		EntityID:     "testEntityID",
 	}
 }
 
@@ -92,6 +94,7 @@ func (s *Service) Test(options interface{}) error {
 		o.Teams,
 		o.Recipients,
 		o.MessageType,
+		o.PreviousType,
 		o.Message,
 		o.EntityID,
 		time.Now(),
@@ -99,8 +102,8 @@ func (s *Service) Test(options interface{}) error {
 	)
 }
 
-func (s *Service) Alert(teams []string, recipients []string, messageType, message, entityID string, t time.Time, details models.Result) error {
-	url, post, err := s.preparePost(teams, recipients, messageType, message, entityID, t, details)
+func (s *Service) Alert(teams []string, recipients []string, messageType, previousLevel, message, entityID string, t time.Time, details models.Result) error {
+	url, post, err := s.preparePost(teams, recipients, messageType, previousLevel, message, entityID, t, details)
 	if err != nil {
 		return err
 	}
@@ -127,7 +130,35 @@ func (s *Service) Alert(teams []string, recipients []string, messageType, messag
 	return nil
 }
 
-func (s *Service) preparePost(teams []string, recipients []string, messageType, message, entityID string, t time.Time, details models.Result) (string, io.Reader, error) {
+func (s *Service) DuplicateAlert(teams []string, recipients []string, messageType, previousLevel, message, entityID string, t time.Time, details models.Result) error {
+	url, post, err := s.prepareDuplicatePost(teams, recipients, messageType, previousLevel, message, entityID, t, details)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Post(url, "application/json", post)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		type response struct {
+			Message string `json:"message"`
+		}
+		r := &response{Message: fmt.Sprintf("failed to understand OpsGenie response. code: %d content: %s", resp.StatusCode, string(body))}
+		b := bytes.NewReader(body)
+		dec := json.NewDecoder(b)
+		dec.Decode(r)
+		return errors.New(r.Message)
+	}
+	return nil
+}
+
+func (s *Service) preparePost(teams []string, recipients []string, messageType, previousLevel, message, entityID string, t time.Time, details models.Result) (string, io.Reader, error) {
 	c := s.config()
 	if !c.Enabled {
 		return "", nil, errors.New("service is not enabled")
@@ -138,7 +169,6 @@ func (s *Service) preparePost(teams []string, recipients []string, messageType, 
 
 	ogData["apiKey"] = c.APIKey
 	ogData["entity"] = entityID
-	ogData["alias"] = entityID
 	ogData["message"] = message
 	ogData["note"] = ""
 	ogData["monitoring_tool"] = "kapacitor"
@@ -154,7 +184,67 @@ func (s *Service) preparePost(teams []string, recipients []string, messageType, 
 	case "RECOVERY":
 		url = c.RecoveryURL + "/"
 		ogData["note"] = message
+		ogData["alias"] = entityID + ":tag_level=" + previousLevel
+	default:
+		ogData["alias"] = entityID + ":tag_level=" + messageType
 	}
+
+	b, err := json.Marshal(details)
+	if err != nil {
+		return "", nil, err
+	}
+	ogData["description"] = string(b)
+
+	if len(teams) == 0 {
+		teams = c.Teams
+	}
+
+	if len(teams) > 0 {
+		ogData["teams"] = teams
+	}
+
+	if len(recipients) == 0 {
+		recipients = c.Recipients
+	}
+
+	if len(recipients) > 0 {
+		ogData["recipients"] = recipients
+	}
+
+	// Post data to VO
+	var post bytes.Buffer
+	enc := json.NewEncoder(&post)
+	err = enc.Encode(ogData)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return url, &post, nil
+}
+
+func (s *Service) prepareDuplicatePost(teams []string, recipients []string, messageType, previousLevel, message, entityID string, t time.Time, details models.Result) (string, io.Reader, error) {
+	c := s.config()
+	if !c.Enabled {
+		return "", nil, errors.New("service is not enabled")
+	}
+
+	ogData := make(map[string]interface{})
+	url := c.RecoveryURL + "/"
+	ogData["note"] = message
+	ogData["alias"] = entityID + ":tag_level=" + previousLevel
+
+	ogData["apiKey"] = c.APIKey
+	ogData["entity"] = entityID
+	ogData["message"] = message
+	ogData["note"] = message
+	ogData["monitoring_tool"] = "kapacitor"
+
+	//Extra Fields (can be used for filtering)
+	ogDetails := make(map[string]interface{})
+	ogDetails["Level"] = messageType
+	ogDetails["Monitoring Tool"] = "Kapacitor"
+
+	ogData["details"] = ogDetails
 
 	b, err := json.Marshal(details)
 	if err != nil {
@@ -213,9 +303,42 @@ func (s *Service) Handler(c HandlerConfig, ctx ...keyvalue.T) alert.Handler {
 
 func (h *handler) Handle(event alert.Event) {
 	var messageType string
+	var previousLevel string
+
 	switch event.State.Level {
 	case alert.OK:
 		messageType = "RECOVERY"
+		previousLevel = event.PreviousState().Level.String()
+	case alert.Critical:
+		messageType = "CRITICAL"
+		previousLevel = event.PreviousState().Level.String()
+		if err := h.s.DuplicateAlert(
+			h.c.TeamsList,
+			h.c.RecipientsList,
+			messageType,
+			previousLevel,
+			event.State.Message,
+			event.State.ID,
+			event.State.Time,
+			event.Data.Result,
+		); err != nil {
+			h.diag.Error("failed to send event to OpsGenie", err)
+		}
+	case alert.Warning:
+		messageType = "WARNING"
+		previousLevel = event.PreviousState().Level.String()
+		if err := h.s.DuplicateAlert(
+			h.c.TeamsList,
+			h.c.RecipientsList,
+			messageType,
+			previousLevel,
+			event.State.Message,
+			event.State.ID,
+			event.State.Time,
+			event.Data.Result,
+		); err != nil {
+			h.diag.Error("failed to send event to OpsGenie", err)
+		}
 	default:
 		messageType = event.State.Level.String()
 	}
@@ -223,6 +346,7 @@ func (h *handler) Handle(event alert.Event) {
 		h.c.TeamsList,
 		h.c.RecipientsList,
 		messageType,
+		previousLevel,
 		event.State.Message,
 		event.State.ID,
 		event.State.Time,

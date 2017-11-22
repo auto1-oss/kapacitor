@@ -41,3 +41,5 @@ docker run \
 docker cp "$dataname:$HOME_DIR/go/src/github.com/influxdata/kapacitor/build" \
     ./
 docker rm -v $dataname
+
+tar -czf build/kapacitor.tar.gz build/kapacitor build/kapacitord build/tickfmt

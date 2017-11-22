@@ -6,7 +6,7 @@ FROM ubuntu:latest
 MAINTAINER support@influxdb.com
 
 RUN apt-get -qq update && apt-get -qq install -y \
-    python-software-properties \
+#    python-software-properties \
     software-properties-common \
     wget \
     unzip \
